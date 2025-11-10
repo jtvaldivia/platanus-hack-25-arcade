@@ -262,9 +262,9 @@ class GameScene extends Phaser.Scene {
   _spawnEnemy(isBoss=false){
     let tries=0,x,y;
     const hasEscape=(ix,iy)=>{ const ds=[[0,1],[0,-1],[1,0],[-1,0]]; let ok=0; for(const [dx,dy] of ds){ const nx=ix+dx, ny=iy+dy; if(nx<0||ny<0||nx>=GW||ny>=GH) continue; if(this.grid[ny][nx]!==0) continue; if(this.bombs.some(b=>b.x===nx&&b.y===ny)) continue; ok++; }
-      return ok>=1; };
+      return ok>=2; };
     do{ x = 1+Math.floor(Math.random()*(GW-2)); y = 1+Math.floor(Math.random()*(GH-2)); tries++; } while( (this.grid[y] && this.grid[y][x]!==0 || !hasEscape(x,y)) && tries<220);
-    if(tries<220){ if(isBoss) this.enemies.push({type:'boss',x,y,pow:3,hp:3+Math.floor(this.level/2),placeCd:1.0,next:0,spd:0.9 - Math.min(.45,this.level*0.02)}); else this.enemies.push({type:'enemy',x,y,pow:2,placeCd:2.2,next:0,spd:0.8 - Math.min(.45,this.level*0.03)}); }
+    if(tries<220){ if(isBoss) this.enemies.push({type:'boss',x,y,pow:Math.min(5,3+Math.floor(this.level/3)),hp:4+Math.floor(this.level*0.8),placeCd:0.6+Math.random()*0.6,next:0,spd:0.8 - Math.min(.45,this.level*0.018), fleeUntil:0, noBombUntil:(this.time.now/1000)+5.0}); else this.enemies.push({type:'enemy',x,y,pow:2,placeCd:1.6+Math.random()*0.8,next:0,spd:0.8 - Math.min(.45,this.level*0.03), fleeUntil:0, noBombUntil:(this.time.now/1000)+5.0}); }
   }
   _spawnBoss(){ this._spawnEnemy(true); }
 
@@ -280,7 +280,7 @@ class GameScene extends Phaser.Scene {
     const bc = this.bombs.filter(b=>b.owner===owner).length;
     if(bc >= owner.bombCnt) return;
     if(this.bombs.some(b=>b.x===owner.x && b.y===owner.y)) return;
-    const b = {x:owner.x,y:owner.y,timer:1.9,owner,pow:owner.bombPow||2, moving:false, fromX:owner.x,fromY:owner.y,toX:owner.x,toY:owner.y,moveStart:0,moveDur:0.12, displayX:owner.x, displayY:owner.y};
+    const b = {x:owner.x,y:owner.y,timer:1.9,owner,pow:(owner.bombPow||owner.pow||2), moving:false, fromX:owner.x,fromY:owner.y,toX:owner.x,toY:owner.y,moveStart:0,moveDur:0.12, displayX:owner.x, displayY:owner.y};
     this.bombs.push(b); owner.invUntil = this.time.now + Math.floor(0.45*1000);
     if(this.game._audioCtx) AudioSys.sfx(this.game._audioCtx,'place');
   }
@@ -295,49 +295,74 @@ class GameScene extends Phaser.Scene {
     for(const e of this.enemies){
       e.next -= d; e.placeCd -= d;
       if(e.next <= 0){
+        const nowS = this.time.now/1000;
         const inDanger = tileInDanger(this.bombs,e.x,e.y,0.6) || this._isHazard(e.x,e.y);
         let moved=false;
-        if(inDanger){
+        // flee window after placing a bomb
+        if(!moved && e.fleeUntil && nowS < e.fleeUntil){
+          const flee = this._nearestSafeStep(e.x,e.y);
+          if(flee){ this._queueMove(e,flee[0],flee[1]); moved=true; }
+        }
+        if(!moved && inDanger){
           const safe = this._nearestSafeStep(e.x,e.y);
           if(safe){ this._queueMove(e,safe[0],safe[1]); moved=true; }
         }
         if(!moved){
           const target = this._nearestPlayer(e.x,e.y);
           if(target){
-            // score neighbors: distance + dead-end penalty + danger
-            let best=null,bd=1e9;
-            for(const [dx,dy] of [[0,-1],[0,1],[-1,0],[1,0]]){
-              const nx=e.x+dx, ny=e.y+dy; if(!this._canMove(nx,ny,true)) continue;
-              const dist=Math.abs(nx-target.x)+Math.abs(ny-target.y);
-              const exits=this._freeNeighbors(nx,ny);
-              const deadPen = exits<=1?2.2:(exits===2?0.6:0);
-              const danger = tileInDanger(this.bombs,nx,ny,0.6)||this._isHazard(nx,ny)?6:0;
-              const score = dist + deadPen + danger;
-              if(score<bd){bd=score; best=[dx,dy];}
+            // prefer BFS step that avoids danger/hazard
+            const step = this._pathStep(e.x,e.y,target.x,target.y);
+            if(step){ this._queueMove(e,step[0],step[1]); moved=true; }
+            else {
+              // fallback: score neighbors (distance + stronger dead-end + danger)
+              let best=null,bd=1e9;
+              for(const [dx,dy] of [[0,-1],[0,1],[-1,0],[1,0]]){
+                const nx=e.x+dx, ny=e.y+dy; if(!this._canMove(nx,ny,true)) continue;
+                const dist=Math.abs(nx-target.x)+Math.abs(ny-target.y);
+                const exits=this._freeNeighbors(nx,ny);
+                const deadPen = exits<=1?3.5:(exits===2?1.2:0);
+                const danger = (tileInDanger(this.bombs,nx,ny,0.8)||this._isHazard(nx,ny))?8:0;
+                const score = dist + deadPen + danger;
+                if(score<bd){bd=score; best=[dx,dy];}
+              }
+              if(best){ this._queueMove(e,best[0],best[1]); moved=true; }
             }
-            if(best){ this._queueMove(e,best[0],best[1]); moved=true; }
           }
         }
-        if(!moved){ const dirs=[[0,-1],[0,1],[-1,0],[1,0]]; const r=dirs[Math.floor(Math.random()*dirs.length)]; if(this._canMove(e.x+r[0],e.y+r[1],true)) this._queueMove(e,r[0],r[1]); }
+        if(!moved){ const dirs=[[0,-1],[0,1],[-1,0],[1,0]]; const safeDirs=[]; for(const [dx,dy] of dirs){ const nx=e.x+dx, ny=e.y+dy; if(!this._canMove(nx,ny,true)) continue; if(this._isHazard(nx,ny) || tileInDanger(this.bombs,nx,ny,0.8)) continue; safeDirs.push([dx,dy]); } const choice = (safeDirs.length? safeDirs[Math.floor(Math.random()*safeDirs.length)] : dirs[Math.floor(Math.random()*dirs.length)]); if(this._canMove(e.x+choice[0],e.y+choice[1],true)) this._queueMove(e,choice[0],choice[1]); }
         e.next = Math.max(.12, e.spd * (0.55 + Math.random()*0.8));
       }
       if(e.placeCd <= 0){
-        let will=false;
+        let will=false; const nowS=this.time.now/1000; const eExits=this._freeNeighbors(e.x,e.y);
         const target = this._nearestPlayer(e.x,e.y);
+        const dist = target ? (Math.abs(target.x-e.x)+Math.abs(target.y-e.y)) : 99;
         const aligned = target ? this._alignedClear(e.x,e.y,target.x,target.y) : false;
-        const closeToPlayer = target ? (Math.abs(target.x-e.x)+Math.abs(target.y-e.y) <= 2) : false;
-        if(aligned || closeToPlayer || Math.random()<0.4 || e.type==='boss'){
-          const cand=[{x:e.x,y:e.y},{x:e.x+1,y:e.y},{x:e.x-1,y:e.y},{x:e.x,y:e.y+1},{x:e.x,y:e.y-1}];
+        const closeToPlayer = dist <= 2;
+        const nearRange = dist <= ((e.pow||2) + 1);
+        // quick estimate of player's safe exits
+        const pSafeEx = target ? (()=>{ let c=0; for(const [dx,dy] of [[0,-1],[0,1],[-1,0],[1,0]]){ const nx=target.x+dx, ny=target.y+dy; if(nx<0||ny<0||nx>=GW||ny>=GH) continue; if(this.grid[ny][nx]!==0) continue; if(this.bombs.some(b=>b.x===nx&&b.y===ny)) continue; if(this._isHazard(nx,ny) || tileInDanger(this.bombs,nx,ny,0.7)) continue; c++; } return c; })() : 2;
+        if(target){
+          if(aligned && (nearRange || pSafeEx<=1)) will=true;
+          else if(closeToPlayer && Math.random()<0.3) will=true;
+          else if(Math.random()< (e.type==='boss'?0.5:0.2)) will=true;
+        }
+        // early game bomb guard
+        if(will && e.noBombUntil && nowS < e.noBombUntil) will=false;
+        if(will && eExits<=1) will=false;
+        // don't bomb if standing in hazard or immediate danger
+        if(will && (this._isHazard(e.x,e.y) || tileInDanger(this.bombs,e.x,e.y,0.6))) will=false;
+        if(will){
+          const cand=[{x:e.x,y:e.y}];
           for(const c of cand){
             if(c.x<0||c.y<0||c.x>=GW||c.y>=GH) continue;
             if(this.grid[c.y][c.x]!==0) continue;
-            // quick safe-check: any escape tile from c not in explosion immediate?
-            const safe = (()=>{ const q=[{x:c.x,y:c.y,d:0}], seen=Array.from({length:GH},()=>Array(GW).fill(false)); seen[c.y][c.x]=true; while(q.length){ const cur=q.shift(); if(cur.d>3) continue; if(!tileInDanger(this.bombs,cur.x,cur.y,0.7) && !this._isHazard(cur.x,cur.y)) return true; for(const [dx,dy] of [[0,1],[0,-1],[1,0],[-1,0]]){ const nx=cur.x+dx, ny=cur.y+dy; if(nx<0||ny<0||nx>=GW||ny>=GH) continue; if(seen[ny][nx]) continue; if(this.grid[ny][nx]!==0) continue; if(this.bombs.some(bm=>bm.x===nx&&bm.y===ny)) continue; seen[ny][nx]=true; q.push({x:nx,y:ny,d:cur.d+1}); } } return false; })();
-            if(safe){ will=true; break; }
+            const chainDanger = this._chainDangerFrom(c.x,c.y,(e.pow||2));
+            const safe = (()=>{ const q=[{x:c.x,y:c.y,d:0}], seen=Array.from({length:GH},()=>Array(GW).fill(false)); seen[c.y][c.x]=true; while(q.length){ const cur=q.shift(); if(cur.d>6) continue; const key=`${cur.x},${cur.y}`; const inNewBlast = chainDanger.has(key); const immediate = tileInDanger(this.bombs,cur.x,cur.y,0.9) || this._isHazard(cur.x,cur.y) || inNewBlast; if(cur.d>=5 && !immediate) return true; for(const [dx,dy] of [[0,1],[0,-1],[1,0],[-1,0]]){ const nx=cur.x+dx, ny=cur.y+dy; if(nx<0||ny<0||nx>=GW||ny>=GH) continue; if(seen[ny][nx]) continue; if(this.grid[ny][nx]!==0) continue; if(this.bombs.some(bm=>bm.x===nx&&bm.y===ny)) continue; seen[ny][nx]=true; q.push({x:nx,y:ny,d:cur.d+1}); } } return false; })();
+            const exitsOK = this._freeNeighbors(c.x,c.y) >= 2;
+            if(safe && exitsOK){ this._placeBomb(e); e.fleeUntil = nowS + 1.4; break; }
           }
         }
-        if(will) this._placeBomb(e);
-        e.placeCd = (e.type==='boss'?1.0:2.0) + Math.random()*1.2;
+        e.placeCd = (e.type==='boss'?0.7:2.0) + Math.random()*(e.type==='boss'?0.9:1.2);
       }
     }
 
@@ -614,7 +639,7 @@ class GameScene extends Phaser.Scene {
     if(e.type==='boss'){
       g.fillStyle(0x6a1b9a,1); g.fillRect(cx - TILE*0.34, cy - TILE*0.2, TILE*0.68, TILE*0.5);
       g.fillStyle(0xffd1a4,1); g.fillCircle(cx, cy - TILE*0.36, TILE*0.17);
-      const bx = cx - TILE*0.34, by = cy - TILE*0.44, w = TILE*0.68, hw = Math.max(2, Math.floor(w*(e.hp/(3+Math.floor(this.level/2))))); g.fillStyle(0x000000,0.6); g.fillRect(bx,by,w,8); g.fillStyle(0xff5252,1); g.fillRect(bx,by,hw,8);
+      const bx = cx - TILE*0.34, by = cy - TILE*0.44, w = TILE*0.68; const maxHp = 4+Math.floor(this.level*0.8); const ratio = Math.min(1, (e.hp)/(maxHp)); const hw = Math.max(2, Math.floor(w*ratio)); g.fillStyle(0x000000,0.6); g.fillRect(bx,by,w,8); g.fillStyle(0xff5252,1); g.fillRect(bx,by,hw,8);
     } else {
       g.fillStyle(0x8d6e63,1); g.fillRect(cx - TILE*0.12, cy - TILE*0.08, TILE*0.24, TILE*0.32);
       g.fillStyle(0xffe0b2,1); g.fillCircle(cx, cy - TILE*0.28, TILE*0.12);
@@ -654,6 +679,30 @@ class GameScene extends Phaser.Scene {
     if(sx===tx){ const dy=sy<ty?1:-1; for(let y=sy+dy; y!==ty; y+=dy){ if(this.grid[y][sx]!==0) return false; if(this.bombs.some(b=>b.x===sx&&b.y===y)) return false; } return true; }
     if(sy===ty){ const dx=sx<tx?1:-1; for(let x=sx+dx; x!==tx; x+=dx){ if(this.grid[sy][x]!==0) return false; if(this.bombs.some(b=>b.x===x&&b.y===sy)) return false; } return true; }
     return false;
+  }
+  _chainDangerFrom(sx,sy,pow){
+    const danger = new Set();
+    const bmap = new Map();
+    for(const b of this.bombs){ bmap.set(`${b.x},${b.y}`, b.pow||2); }
+    bmap.set(`${sx},${sy}`, pow||2);
+    const q=[{x:sx,y:sy,pow:pow||2}];
+    const seen=new Set([`${sx},${sy}`]);
+    const dirs=[[0,0],[0,-1],[0,1],[-1,0],[1,0]];
+    while(q.length){
+      const cur=q.shift();
+      for(const [dx,dy] of dirs){
+        for(let r=0;r<cur.pow;r++){
+          const ex=cur.x+dx*r, ey=cur.y+dy*r;
+          if(ex<0||ey<0||ex>=GW||ey>=GH) break;
+          if(this.grid[ey][ex]===1) break;
+          danger.add(`${ex},${ey}`);
+          if(this.grid[ey][ex]===2) break;
+          const k=`${ex},${ey}`;
+          if(bmap.has(k) && !seen.has(k)){ seen.add(k); q.push({x:ex,y:ey,pow:bmap.get(k)||2}); }
+        }
+      }
+    }
+    return danger;
   }
   _hitPlayer(p){
     if(this.time.now <= (p.invUntil||0)) return;
